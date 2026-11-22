@@ -38,6 +38,21 @@ python -m web.app         # 页面
 读循环按 MBAP 长度前缀切帧。TCP 是字节流，Modbus/TCP 的长度前缀让回包切分
 与「哪笔请求先发」无关，所以仪表可以任意顺序回包。
 
+### FC03 发送队列
+
+受理的读取先进入发送队列，由写循环**严格按入队顺序**写到仪表 socket；写端
+不等回包，因此线上可同时有多笔在途。每个队列条目都引用它在映射表里的记录，
+写循环落笔前用**对象同一性**（不是事务号）确认记录仍然存活：
+
+- 写端阻塞（TCP 背压、或用演示控制暂停发送）时队列积压，读取时限照常计时。
+- 队列中的读取一旦**超时或客户端断开**，记录立即从映射表摘除、腾出
+  `max_inflight` 名额（计数 `cancelled_before_send`）；写端恢复后写循环扫到
+  该条目时直接跳过——**已报超时的读取不会再发给仪表**。
+- 因为记录是按对象比较的，内部事务号在记录未写出时被释放后可以立即复用，
+  旧条目即使与新请求撞号也仍然是无效条目，不会把旧请求发出去。
+- 只有真正写进 socket 的请求才进入「在途」语义：超时留墓碑、迟到回包丢弃、
+  仪表断线时按 `0x0B` 失败——这些行为与之前完全一致。
+
 ### 事务号：改写、还原、隔离
 
 两套巡检程序可能各自从同一个号开始编（例如都用 7）。网关在转发前把事务号
@@ -51,12 +66,13 @@ python -m web.app         # 页面
 ### 超时、迟到回包、断开
 
 - 每笔在途请求有一个 `request_timeout` 定时器。超时后：从映射表摘除、给客户端回
-  Modbus 异常 `0x0B`（gateway target failed to respond），并把内部号放进墓碑
-  （`late_response_quarantine`，默认 `max(30s, 2×timeout)`），期间不复用。
+  Modbus 异常 `0x0B`（gateway target failed to respond）；已写出的请求把内部号放进墓碑
+  （`late_response_quarantine`，默认 `max(30s, 2×timeout)`），期间不复用；尚未写出的
+  请求不需要墓碑（仪表没见过它，不可能有迟到回包），内部号与名额立即回收。
 - 真正的迟到回包到达时映射表里已无该内部号 → 直接丢弃并计数
   `late_responses_dropped`，绝不会串到别的客户端。
-- 客户端断开（或写不出去）：该会话的在途请求全部摘除并进入墓碑；之后的迟到回包
-  同样丢弃。
+- 客户端断开（或写不出去）：该会话的在途请求全部摘除（已写出的进墓碑，未写出的
+  直接取消）；之后的迟到回包同样丢弃。
 - 仪表断线：上游 supervisor 立刻让**全部在途读取**以 `0x0B` 失败；断线期间新请求
   立即以 `0x0A`（gateway path unavailable）失败，不排队不挂起。随后自动重连
   （退避 `reconnect_delay`），重连成功后清空墓碑——旧 socket 已销毁，旧号不可能
@@ -72,6 +88,9 @@ python -m web.app         # 页面
 - 单客户端接收缓冲上限 64 KiB，超长直接断开。
 - 每客户端回包队列上限 1024 帧，写不出去说明客户端不读了，断开而不是无限缓冲。
 - 全局在途上限 `max_inflight`（默认 4096），超出回 `0x06 server busy`。
+  待发队列里的读取同样占名额；超时或断开的读取立即释放名额。
+- 网关状态端口提供演示控制 `POST /pause` / `POST /resume`：暂停上游写循环，
+  用来现场演练「写端阻塞时超时/断开的读取不再发送」。
 
 ## 演示页
 
@@ -79,29 +98,35 @@ python -m web.app         # 页面
   点击后两路在不同线程里同时发起，结果分栏显示读数、耗时、回包事务号。
 - **仪表行为控制**：统一延迟回包、先到先回 / 后到先回、卡住下一次回包
   （`stall`）、断开 / 恢复仪表、全部复位。
-- **状态面板**：网关的连接状态、在途数、成功/超时/丢弃迟到回包计数；
-  仪表的设置、接入/拒绝连接数，以及仪表实际看到的最近事务号（同号并发时
-  这里应显示两个不同的改写号）。
+- **网关发送队列**：暂停 / 恢复向仪表发送。暂停期间发起的读取在网关待发队列
+  排队、时限照常；超时或断开的读取恢复后不会再发出——配合状态面板可直接验证。
+- **状态面板**：网关的连接状态、发送状态、在途数、**待发数**、成功/超时/
+  未发出即取消/丢弃迟到回包计数；仪表的设置、接入/拒绝连接数、**累计收到请求数**，
+  以及仪表实际看到的最近事务号（同号并发时这里应显示两个不同的改写号）。
 
 ## 测试与实测
 
 ```bash
-pytest -q                       # 23 个用例（codec 7 + 网关 10 + 页面 6）
-python scripts/verify_stack.py  # 对已启动的栈跑三个验收场景
+pytest -q                       # 30 个用例（codec 7 + 网关 16 + 页面 7）
+python scripts/verify_stack.py  # 对已启动的栈跑四个验收场景
 ```
 
 `tests/` 直接起真实的 meter + gateway（随机端口）跑异步集成测试，覆盖：
 同号双客户端乱序回包、单连接多笔同号并发、超时后重试、迟到回包丢弃、
 客户端断开后同号复用、仪表断线与恢复、非 03 功能码拒绝、仪表异常转发、
-40 笔同号压力；`tests/test_web.py` 通过 Flask test client 跑通页面三条链路。
+40 笔同号压力，以及发送队列专项：暂停期间超时/断开的读取恢复后不再发送、
+有效读取按入队顺序发出、待发读取计入 `max_inflight` 且超时即释放名额、
+已写出请求不受暂停影响、内部号复用后旧队列条目仍是空操作；
+`tests/test_web.py` 通过 Flask test client 跑通页面链路（含暂停/恢复代理）。
 
-`scripts/verify_stack.py` 用真实 socket + HTTP 驱动黑盒栈，输出三行结论。
+`scripts/verify_stack.py` 用真实 socket + HTTP 驱动黑盒栈，输出四行结论。
 最近一次在本机（非 Docker）实跑：
 
 ```
 [ OK ] same transaction id, reordered answers: A=[7, 10] B=[607, 610, 613]; both kept client txid 0x0077; meter exceptions/connects unchanged (1)
-[ OK ] timeout, retry, late answer dropped: timeout after 2032 ms -> exception 0x0B; retry returned [37, 40]; late answer dropped (total 1)
+[ OK ] timeout, retry, late answer dropped: timeout after 1020 ms -> exception 0x0B; retry returned [37, 40]; late answer dropped (total 1)
 [ OK ] meter disconnect, fail fast, recover: in-flight read failed with 0x0B; offline read failed in 1 ms with 0x0A; after recovery read returned [67, 70] (connects=2)
+[ OK ] paused sender: queued timeout/disconnect never sent: queued read timed out with 0x0B and freed its slot; disconnected read dropped; after resume the meter saw only the fresh read [103] (cancelled_before_send=2)
 ```
 
 ## 配置
@@ -110,6 +135,7 @@ python scripts/verify_stack.py  # 对已启动的栈跑三个验收场景
 `GATEWAY_REQUEST_TIMEOUT`（默认 3.0）、`GATEWAY_CONNECT_TIMEOUT`（2.0）、
 `GATEWAY_RECONNECT_DELAY`（0.5）、`GATEWAY_MAX_INFLIGHT`（4096）、
 `GATEWAY_STATUS_PORT`（8081）、`LOG_LEVEL`。
+状态端口另有演示控制 `POST /pause` / `POST /resume`（暂停/恢复上游写循环）。
 页面：`UI_GATEWAY_HOST/PORT`、`UI_GATEWAY_STATUS_HOST/PORT`、
 `UI_METER_HOST`、`UI_METER_CONTROL_PORT`、`UI_CLIENT_TIMEOUT`（默认 6）。
 
@@ -121,7 +147,8 @@ python scripts/verify_stack.py  # 对已启动的栈跑三个验收场景
 - **重连后墓碑清空**依赖「旧 socket 关闭即旧回包不可能再被读到」这一事实，
   对 TCP 成立；如果将来改成多上游复用则需重新论证。
 - 网关与页面都是单进程内存态：重启丢失统计；页面用 Flask 开发服务器，
-  仅适合演示，生产应换 WSGI/ASGI 服务器并加认证。
+  仅适合演示，生产应换 WSGI/ASGI 服务器并加认证。`POST /pause` / `POST /resume`
+  是未认证的演示控制，仅限可信网段使用。
 - 仅实现 FC03（按需求）；没有实现 FC01/02/04、多从站网关路由、广播。
 - 上游断线重连期间不接受「排队等重连」的请求，直接失败——这是为了不掩盖故障，
   若巡检程序需要缓冲，应在外层重试。

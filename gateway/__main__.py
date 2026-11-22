@@ -9,6 +9,10 @@ GATEWAY_CONNECT_TIMEOUT           seconds for the meter TCP connect (default 2.0
 GATEWAY_RECONNECT_DELAY           pause between reconnect attempts (default 0.5)
 GATEWAY_MAX_INFLIGHT              per-device in-flight cap (default 4096)
 GATEWAY_STATUS_HOST/PORT          JSON status endpoint (default 0.0.0.0:8081)
+
+The status endpoint serves GET /stats and GET /health, plus the demo controls
+POST /pause and POST /resume, which hold and release the upstream write loop
+so the send-queue behaviour can be observed live.
 """
 
 from __future__ import annotations
@@ -17,7 +21,7 @@ import asyncio
 import logging
 import os
 
-from common.httpjson import JsonStatusServer
+from common.httpjson import HttpJsonServer
 from gateway.core import GatewayConfig, ModbusGateway
 
 
@@ -48,13 +52,36 @@ def config_from_env() -> GatewayConfig:
     )
 
 
+def make_dispatcher(gateway: ModbusGateway):
+    """GET for status, POST for the send-gate demo control."""
+
+    async def dispatch(method: str, target: str) -> tuple[int, object]:
+        path = target.split("?", 1)[0]
+        if method == "GET":
+            if path == "/stats":
+                return 200, gateway.stats_snapshot()
+            if path == "/health":
+                return 200, {"ok": True}
+            return 404, {"error": "not found"}
+        if method == "POST":
+            if path == "/pause":
+                gateway.set_send_paused(True)
+                return 200, gateway.stats_snapshot()
+            if path == "/resume":
+                gateway.set_send_paused(False)
+                return 200, gateway.stats_snapshot()
+            return 404, {"error": "not found"}
+        return 405, {"error": "unsupported method"}
+
+    return dispatch
+
+
 async def serve() -> None:
     gateway = ModbusGateway(config_from_env())
-    status = JsonStatusServer(
-        provider=gateway.stats_snapshot,
+    status = HttpJsonServer(
+        make_dispatcher(gateway),
         host=os.environ.get("GATEWAY_STATUS_HOST", "0.0.0.0"),
         port=_env_int("GATEWAY_STATUS_PORT", 8081),
-        routes={"/health": lambda: {"ok": True}},
     )
     await gateway.start()
     await status.start()

@@ -88,6 +88,21 @@
     <div id="control-status" class="status-line"></div>
   </section>
 
+  <section class="card">
+    <h2>网关发送队列（写端阻塞演练）</h2>
+    <div class="row">
+      <button id="gw-pause" class="danger">暂停向仪表发送</button>
+      <button id="gw-resume" class="primary">恢复发送</button>
+      <span id="send-state" class="pill">发送中</span>
+    </div>
+    <p class="hint">
+      暂停期间发起的读取只在网关待发队列排队，读取时限照常计时；超时或客户端断开的读取会
+      立即腾出待发名额，<b>恢复发送后不会再发给仪表</b>。用「同时读取两路」发起读取，
+      对照下方状态面板的「待发读取」与仪表实际收到的请求数即可验证。
+    </p>
+    <div id="gateway-control-status" class="status-line"></div>
+  </section>
+
   <section class="results">
     <article class="card result" id="result-a">
       <h2>通道 A <span class="txid" id="txid-a"></span></h2>

@@ -6,6 +6,15 @@ is unique among all requests currently in flight, keeps a map, and restores the
 client's original id when the answer comes back.  Answers that no longer have a
 live map entry -- because the request timed out or the client went away -- are
 dropped.
+
+Accepted reads are handed to the upstream link through a send queue and are
+written to the meter socket strictly in enqueue order; several requests may be
+in flight on the wire at once.  Each queue entry references its pending-table
+record, so a read that times out or loses its client *while still queued* is
+skipped when the writer reaches it: it frees its slot immediately and is never
+sent to the meter, even if the write side was blocked and only recovers later.
+Only once a request has actually been written to the socket does the
+late-response machinery (txid tombstones, drop counting) apply to it.
 """
 
 from __future__ import annotations
@@ -52,6 +61,7 @@ class GatewayStats:
     responses_total: int = 0
     timeouts_total: int = 0
     late_responses_dropped: int = 0
+    cancelled_before_send: int = 0
     upstream_exceptions_relayed: int = 0
     rejected_unsupported: int = 0
     rejected_not_connected: int = 0
@@ -69,6 +79,11 @@ class _PendingRequest:
     unit_id: int
     session: "_ClientSession"
     timer: asyncio.TimerHandle | None = None
+    # Flipped by the upstream writer just before the bytes hit the socket.
+    # A request that never reached the meter can leave the send queue
+    # without a txid tombstone: the meter never saw it, so no late answer
+    # for it can ever arrive.
+    written: bool = False
 
 
 @dataclass(eq=False)
@@ -183,14 +198,29 @@ class _UpstreamLink:
 
     def __init__(self, gateway: "ModbusGateway") -> None:
         self._gateway = gateway
-        self._queue: asyncio.Queue[bytes] = asyncio.Queue()
+        self._queue: asyncio.Queue[tuple[_PendingRequest, bytes]] = asyncio.Queue()
         self._connected = False
         self._stopping = False
         self._supervisor: asyncio.Task | None = None
+        # Demo/diagnostic control: while cleared, the write loop holds off
+        # pulling requests out of the send queue.  The gate belongs to the
+        # link, not to one connection, so a pause survives reconnects.
+        self._send_gate = asyncio.Event()
+        self._send_gate.set()
 
     @property
     def connected(self) -> bool:
         return self._connected
+
+    @property
+    def paused(self) -> bool:
+        return not self._send_gate.is_set()
+
+    def set_paused(self, paused: bool) -> None:
+        if paused:
+            self._send_gate.clear()
+        else:
+            self._send_gate.set()
 
     def start(self) -> None:
         self._supervisor = asyncio.create_task(self._run(), name="upstream-supervisor")
@@ -203,10 +233,14 @@ class _UpstreamLink:
                 await self._supervisor
         self._connected = False
 
-    def send(self, data: bytes) -> None:
+    def send(self, pending: _PendingRequest, data: bytes) -> None:
         if not self._connected:
             raise ConnectionError("meter link is down")
-        self._queue.put_nowait(data)
+        # The queue is unbounded on purpose: every entry is backed by a
+        # record in the gateway's pending table, which is capped by
+        # max_inflight, and stale entries are skipped (and thereby removed)
+        # by the write loop.
+        self._queue.put_nowait((pending, data))
 
     async def _run(self) -> None:
         cfg = self._gateway.config
@@ -292,7 +326,15 @@ class _UpstreamLink:
 
     async def _write_loop(self, writer: asyncio.StreamWriter) -> None:
         while True:
-            data = await self._queue.get()
+            pending, data = await self._queue.get()
+            # The gate is checked after dequeueing so that pausing takes
+            # effect even when the loop is already parked in ``get``; the
+            # held item is still unwritten and still counted as queued.
+            await self._send_gate.wait()
+            if not self._gateway._mark_written(pending):
+                # Timed out or abandoned while queued: the record is gone,
+                # so this entry is a no-op and the meter never sees it.
+                continue
             writer.write(data)
             await writer.drain()
 
@@ -322,6 +364,22 @@ class ModbusGateway:
     @property
     def inflight(self) -> int:
         return len(self._pending)
+
+    @property
+    def send_paused(self) -> bool:
+        return self._link.paused
+
+    def set_send_paused(self, paused: bool) -> None:
+        """Operator/demo control: hold or release the upstream write loop.
+
+        While paused, accepted reads pile up in the send queue with their
+        timeout timers running; reads that expire or lose their client while
+        queued are dropped from the queue and will not be sent after resume.
+        """
+        if self._link.paused == paused:
+            return
+        self._link.set_paused(paused)
+        log.info("upstream sender %s by operator", "paused" if paused else "resumed")
 
     async def start(self) -> None:
         self._running = True
@@ -432,7 +490,7 @@ class ModbusGateway:
             quantity=request.quantity,
         ).encode()
         try:
-            self._link.send(forwarded)
+            self._link.send(pending, forwarded)
         except ConnectionError:
             self._finish_pending(internal_txid, quarantine=True)
             self.stats.rejected_not_connected += 1
@@ -474,6 +532,20 @@ class ModbusGateway:
         ).encode()
         pending.session.enqueue(response)
 
+    def _mark_written(self, pending: _PendingRequest) -> bool:
+        """Mark ``pending`` as written to the meter iff it is still live.
+
+        The upstream writer calls this just before putting the bytes on the
+        socket.  The identity check matters: an internal txid freed by an
+        unwritten request can be reused immediately, so a stale queue entry
+        may reference a txid that now belongs to a *different* request --
+        comparing objects, not txids, is what keeps that entry a no-op.
+        """
+        if self._pending.get(pending.internal_txid) is not pending:
+            return False
+        pending.written = True
+        return True
+
     def _finish_pending(self, internal_txid: int, quarantine: bool = False) -> _PendingRequest | None:
         pending = self._pending.pop(internal_txid, None)
         if pending is None:
@@ -482,7 +554,13 @@ class ModbusGateway:
             pending.timer.cancel()
             pending.timer = None
         pending.session.pending.discard(internal_txid)
-        if quarantine:
+        if not pending.written:
+            # Never reached the meter: the send-queue entry (if any) is now
+            # stale and will be skipped by the writer, no late answer can
+            # arrive, and the txid needs no tombstone -- the inflight slot
+            # and the id are both free immediately.
+            self.stats.cancelled_before_send += 1
+        elif quarantine:
             self._tombstones[internal_txid] = (
                 asyncio.get_running_loop().time() + self.config.late_response_quarantine
             )
@@ -506,11 +584,10 @@ class ModbusGateway:
                      pending.client_txid)
 
     def _drop_session_pending(self, session: _ClientSession) -> None:
-        now = asyncio.get_running_loop().time()
         for internal_txid in list(session.pending):
-            pending = self._finish_pending(internal_txid)
-            if pending is not None:
-                self._tombstones[internal_txid] = now + self.config.late_response_quarantine
+            # Written requests keep their tombstone (a late answer may still
+            # arrive); queued ones are simply never sent.
+            self._finish_pending(internal_txid, quarantine=True)
 
     def _fail_all_pending(self, exception_code: int, reason: str) -> None:
         if not self._pending:
@@ -566,5 +643,9 @@ class ModbusGateway:
     def stats_snapshot(self) -> dict:
         snapshot = asdict(self.stats)
         snapshot["inflight"] = len(self._pending)
+        snapshot["send_queue"] = sum(
+            1 for pending in self._pending.values() if not pending.written
+        )
+        snapshot["send_paused"] = self._link.paused
         snapshot["upstream_connected"] = self._link.connected
         return snapshot

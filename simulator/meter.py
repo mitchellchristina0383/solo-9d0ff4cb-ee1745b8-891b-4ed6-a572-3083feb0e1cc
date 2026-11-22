@@ -62,6 +62,8 @@ class MeterSimulator:
         self.settings = MeterSettings()
         self.received: list[dict] = []
         self.sent: list[dict] = []
+        self.received_total = 0
+        self.sent_total = 0
         self.connections_accepted = 0
         self.connections_rejected = 0
         self._server: asyncio.base_events.Server | None = None
@@ -132,6 +134,8 @@ class MeterSimulator:
                 "stall_ms": self.settings.stall_ms,
                 "order_stagger_ms": self.settings.order_stagger_ms,
             },
+            "received_total": self.received_total,
+            "sent_total": self.sent_total,
             "received": self.received[-20:],
             "sent": self.sent[-20:],
         }
@@ -243,6 +247,7 @@ class MeterSimulator:
         }
         self.received.append(entry)
         del self.received[:-200]
+        self.received_total += 1
 
     def _record_sent(self, frame: modbus.RawFrame, response: bytes) -> None:
         self.sent.append({
@@ -250,6 +255,7 @@ class MeterSimulator:
             "bytes": response.hex(),
         })
         del self.sent[:-200]
+        self.sent_total += 1
 
     def _build_response(self, frame: modbus.RawFrame) -> bytes:
         if frame.function_code != modbus.FC_READ_HOLDING_REGISTERS:

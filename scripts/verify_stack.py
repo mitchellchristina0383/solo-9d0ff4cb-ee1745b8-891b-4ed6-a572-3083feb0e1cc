@@ -18,6 +18,8 @@ Scenarios
      and the answer that arrives late is dropped
   3. meter disconnects while a read is in flight, new reads fail fast, and
      reads work again after the meter returns
+  4. gateway sender paused: a read that times out in the send queue and a
+     read whose client disconnects are never sent after the resume
 """
 
 from __future__ import annotations
@@ -115,6 +117,12 @@ class Stack:
 
     def control(self, action: str) -> dict:
         return http("POST", f"{self.meter}/{action}")
+
+    def gateway_control(self, action: str) -> dict:
+        return http("POST", f"{self.status}/{action}")
+
+    def meter_state(self) -> dict:
+        return http("GET", f"{self.meter}/state")
 
     def reset(self) -> None:
         self.control("reset")
@@ -222,6 +230,50 @@ def scenario_disconnect(stack: Stack) -> str:
             f"with 0x0A; after recovery read returned {regs} (connects={connects})")
 
 
+def scenario_send_queue(stack: Stack) -> str:
+    stack.reset()
+    stack.gateway_control("pause")
+    try:
+        # 1) A read accepted while the sender is paused sits in the send
+        #    queue; the normal read timeout still applies to it.
+        sock = open_read(stack.gw_host, stack.gw_port, 0x0021, 30, 1)
+        try:
+            frame = recv_frame(sock, 6.0)
+            expect_exception(frame, 0x0021, modbus.EXCEPTION_GATEWAY_TARGET_FAILED)
+        finally:
+            sock.close()
+        # 2) A read whose client disconnects while it sits in the queue.
+        sock = open_read(stack.gw_host, stack.gw_port, 0x0022, 31, 1)
+        sock.close()
+        time.sleep(0.5)  # let the gateway notice the disconnect
+        stats = stack.stats()
+        if stats["inflight"] != 0:
+            raise Failure(f"queued reads did not free their slots (inflight={stats['inflight']})")
+        if stats["cancelled_before_send"] < 2:
+            raise Failure("queued reads were not reported as cancelled before send")
+        received_before = stack.meter_state().get("received_total", 0)
+        # 3) Resume: only reads that are still valid may reach the meter.
+        stack.gateway_control("resume")
+        sock = open_read(stack.gw_host, stack.gw_port, 0x0023, 32, 1)
+        try:
+            frame = recv_frame(sock, 5.0)
+            regs = expect_registers(frame, 0x0023, [32])
+        finally:
+            sock.close()
+        received_after = stack.meter_state().get("received_total", 0)
+        if received_after != received_before + 1:
+            raise Failure(
+                f"meter received {received_after - received_before} requests for 1 fresh "
+                "read; stale queued reads leaked to the meter"
+            )
+    finally:
+        stack.gateway_control("resume")
+    stats = stack.stats()
+    return (f"queued read timed out with 0x0B and freed its slot; disconnected read "
+            f"dropped; after resume the meter saw only the fresh read {regs} "
+            f"(cancelled_before_send={stats['cancelled_before_send']})")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gateway", default="127.0.0.1:5020")
@@ -234,6 +286,7 @@ def main() -> int:
         ("same transaction id, reordered answers", scenario_same_txid),
         ("timeout, retry, late answer dropped", scenario_timeout_retry),
         ("meter disconnect, fail fast, recover", scenario_disconnect),
+        ("paused sender: queued timeout/disconnect never sent", scenario_send_queue),
     ]
     failures = 0
     for title, run in scenarios:

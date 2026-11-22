@@ -115,6 +115,26 @@ def api_gateway_state():
         return jsonify({"ok": False, "error": str(exc)}), 502
 
 
+@app.post("/api/gateway/<action>")
+def api_gateway_control(action: str):
+    """Pause/resume the gateway's upstream sender (send-queue demo)."""
+    if action not in {"pause", "resume"}:
+        return jsonify({"ok": False, "error": "unknown action"}), 404
+    req = urllib.request.Request(
+        f"http://{GATEWAY_STATUS_HOST}:{GATEWAY_STATUS_PORT}/{action}",
+        method="POST",
+        data=b"",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as response:
+            body = response.read().decode()
+            return jsonify(json.loads(body) if body else {})
+    except urllib.error.HTTPError as exc:
+        return jsonify({"ok": False, "error": exc.read().decode()}), exc.code
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"ok": False, "error": f"gateway status unreachable: {exc}"}), 502
+
+
 @app.post("/api/read")
 def api_read():
     spec = request.get_json(silent=True) or {}

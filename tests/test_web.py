@@ -190,3 +190,35 @@ def test_gateway_state_endpoint_reports_stats(rig, monkeypatch):
         assert "timeouts_total" in payload
     finally:
         rig.run(server.stop())
+
+
+def test_gateway_pause_resume_proxy(rig, monkeypatch):
+    """The UI's /api/gateway/pause|resume proxy drives the gateway send gate."""
+    from common.httpjson import HttpJsonServer
+    from gateway.__main__ import make_dispatcher
+
+    status_port = _unused_port()
+
+    async def serve():
+        server = HttpJsonServer(
+            make_dispatcher(rig.gateway), "127.0.0.1", status_port
+        )
+        await server.start()
+        return server
+
+    server = rig.run(serve())
+    monkeypatch.setattr(web_app, "GATEWAY_STATUS_PORT", status_port)
+    try:
+        client = web_app.app.test_client()
+        payload = client.post("/api/gateway/pause").get_json()
+        assert payload["send_paused"] is True
+        assert rig.gateway.send_paused is True
+        payload = client.get("/api/gateway/state").get_json()
+        assert payload["send_paused"] is True
+        assert payload["send_queue"] == 0
+        payload = client.post("/api/gateway/resume").get_json()
+        assert payload["send_paused"] is False
+        assert rig.gateway.send_paused is False
+        assert client.post("/api/gateway/bogus").status_code == 404
+    finally:
+        rig.run(server.stop())

@@ -112,6 +112,29 @@ async function meterAction(action, value, button) {
   }
 }
 
+async function gatewayControl(action, button) {
+  const previous = button.textContent;
+  button.disabled = true;
+  button.textContent = "…";
+  try {
+    const response = await fetch(`/api/gateway/${action}`, {method: "POST"});
+    const data = await response.json();
+    if (!response.ok || data.ok === false) {
+      $("gateway-control-status").textContent = `控制失败：${data.error || response.status}`;
+    } else {
+      $("gateway-control-status").textContent = data.send_paused
+        ? "已暂停：新读取只在待发队列排队，超时或断开的读取将被移出队列。"
+        : "已恢复：队列中仍有效的读取按入队顺序发出，已失效的不再发送。";
+    }
+  } catch (err) {
+    $("gateway-control-status").textContent = `控制失败：${err}`;
+  } finally {
+    button.disabled = false;
+    button.textContent = previous;
+    refreshStats();
+  }
+}
+
 function renderDl(element, rows) {
   element.innerHTML = rows
     .map(([key, value, cls]) =>
@@ -126,10 +149,15 @@ async function refreshStats() {
     renderDl($("gateway-stats"), [
       ["仪表连接", gateway.upstream_connected ? "已连接" : "断开",
         gateway.upstream_connected ? "ok" : "bad"],
+      ["发送状态", gateway.send_paused ? "已暂停" : "发送中",
+        gateway.send_paused ? "bad" : "ok"],
       ["在途读取", gateway.inflight],
+      ["待发读取", gateway.send_queue, gateway.send_queue ? "bad" : ""],
       ["累计请求", gateway.requests_total],
       ["成功回包", gateway.responses_total],
       ["超时", gateway.timeouts_total, gateway.timeouts_total ? "bad" : ""],
+      ["未发出即取消", gateway.cancelled_before_send,
+        gateway.cancelled_before_send ? "bad" : ""],
       ["丢弃迟到回包", gateway.late_responses_dropped,
         gateway.late_responses_dropped ? "bad" : ""],
       ["仪表异常转发", gateway.upstream_exceptions_relayed],
@@ -137,9 +165,12 @@ async function refreshStats() {
       ["最近错误", gateway.last_upstream_error || "—"],
     ]);
     $("banner").textContent = gateway.upstream_connected
-      ? `网关在线 · 仪表连接正常 · 在途 ${gateway.inflight}`
+      ? `网关在线 · 仪表连接正常 · 在途 ${gateway.inflight} · 待发 ${gateway.send_queue}` +
+        (gateway.send_paused ? " · 发送已暂停" : "")
       : "网关在线 · 仪表断开（重连中）";
-    $("banner").className = "banner " + (gateway.upstream_connected ? "up" : "down");
+    $("banner").className = "banner " +
+      (gateway.upstream_connected && !gateway.send_paused ? "up" : "down");
+    $("send-state").textContent = gateway.send_paused ? "已暂停" : "发送中";
   } catch (err) {
     $("banner").textContent = "无法读取网关状态";
     $("banner").className = "banner down";
@@ -159,6 +190,7 @@ async function refreshStats() {
       ["延迟", `${settings.delay_ms} ms`],
       ["回包顺序", settings.mode],
       ["剩余卡住", settings.stall_next],
+      ["累计收到请求", meter.received_total],
       ["累计接受连接", meter.connections_accepted],
       ["拒绝的额外连接", meter.connections_rejected],
       ["instrument txids", txids || "—"],
@@ -170,6 +202,10 @@ async function refreshStats() {
 }
 
 $("read-both").addEventListener("click", readBoth);
+$("gw-pause").addEventListener("click", (event) =>
+  gatewayControl("pause", event.currentTarget));
+$("gw-resume").addEventListener("click", (event) =>
+  gatewayControl("resume", event.currentTarget));
 $("same-txid").addEventListener("change", (event) => {
   $("b-txid").disabled = event.target.checked;
   if (event.target.checked) $("b-txid").value = $("a-txid").value;
