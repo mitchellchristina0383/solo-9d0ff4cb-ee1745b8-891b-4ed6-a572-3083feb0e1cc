@@ -1,0 +1,72 @@
+services:
+  meter:
+    build: .
+    image: modbus-singleconn-demo
+    command: ["python", "-m", "simulator"]
+    environment:
+      METER_LISTEN_HOST: 0.0.0.0
+      METER_LISTEN_PORT: "1502"
+      METER_CONTROL_HOST: 0.0.0.0
+      METER_CONTROL_PORT: "8082"
+      LOG_LEVEL: INFO
+    ports:
+      - "1502:1502"
+      - "8082:8082"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import socket; socket.create_connection(('127.0.0.1', 1502), 2).close()"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 2s
+
+  gateway:
+    build: .
+    image: modbus-singleconn-demo
+    command: ["python", "-m", "gateway"]
+    environment:
+      METER_HOST: meter
+      METER_PORT: "1502"
+      GATEWAY_LISTEN_HOST: 0.0.0.0
+      GATEWAY_LISTEN_PORT: "5020"
+      GATEWAY_REQUEST_TIMEOUT: "3.0"
+      GATEWAY_CONNECT_TIMEOUT: "2.0"
+      GATEWAY_RECONNECT_DELAY: "0.5"
+      GATEWAY_STATUS_HOST: 0.0.0.0
+      GATEWAY_STATUS_PORT: "8081"
+      LOG_LEVEL: INFO
+    ports:
+      - "5020:5020"
+      - "8081:8081"
+    depends_on:
+      meter:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import socket; socket.create_connection(('127.0.0.1', 5020), 2).close()"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 2s
+
+  web:
+    build: .
+    image: modbus-singleconn-demo
+    command: ["python", "-m", "web.app"]
+    environment:
+      UI_HOST: 0.0.0.0
+      UI_PORT: "8080"
+      UI_GATEWAY_HOST: gateway
+      UI_GATEWAY_PORT: "5020"
+      UI_GATEWAY_STATUS_HOST: gateway
+      UI_GATEWAY_STATUS_PORT: "8081"
+      UI_METER_HOST: meter
+      UI_METER_CONTROL_PORT: "8082"
+      UI_CLIENT_TIMEOUT: "6"
+    ports:
+      - "8080:8080"
+    depends_on:
+      gateway:
+        condition: service_started
+      meter:
+        condition: service_started

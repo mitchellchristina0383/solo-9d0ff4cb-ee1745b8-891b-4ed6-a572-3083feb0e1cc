@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Modbus 单连接网关演示</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header>
+  <h1>Modbus TCP 单连接网关</h1>
+  <p class="sub">两路巡查共用一条仪表连接，仅转发功能码 03</p>
+  <div id="banner" class="banner">正在连接…</div>
+</header>
+
+<main>
+  <section class="card wide">
+    <h2>同时发起两路样例读取</h2>
+    <p class="hint">
+      默认两路使用<b>相同的事务号</b>（同号并发）。两路会同时发出，网关需自行区分回包。
+    </p>
+    <table class="reads">
+      <thead>
+      <tr><th>通道</th><th>起始地址</th><th>数量</th><th>事务号</th><th>从站号</th></tr>
+      </thead>
+      <tbody>
+      <tr>
+        <td>通道 A</td>
+        <td><input id="a-address" type="number" min="0" max="65535" value="0"></td>
+        <td><input id="a-quantity" type="number" min="1" max="125" value="2"></td>
+        <td><input id="a-txid" type="number" min="0" max="65535" value="7"></td>
+        <td><input id="a-unit" type="number" min="0" max="255" value="1"></td>
+      </tr>
+      <tr>
+        <td>通道 B</td>
+        <td><input id="b-address" type="number" min="0" max="65535" value="100"></td>
+        <td><input id="b-quantity" type="number" min="1" max="125" value="3"></td>
+        <td><input id="b-txid" type="number" min="0" max="65535" value="7"></td>
+        <td><input id="b-unit" type="number" min="0" max="255" value="1"></td>
+      </tr>
+      </tbody>
+    </table>
+    <div class="row">
+      <button id="read-both" class="primary">同时读取两路</button>
+      <label class="inline"><input id="same-txid" type="checkbox" checked> 强制两路同事务号</label>
+      <span class="hint">点击后两路会并行发出，结果按通道分别显示。</span>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>仪表行为控制（模拟器）</h2>
+    <div class="control-grid">
+      <div>
+        <label>统一延迟回包</label>
+        <div class="row">
+          <input id="delay-ms" type="number" min="0" step="100" value="1500">
+          <button data-action="delay">应用延迟 (ms)</button>
+          <button data-action="delay" data-value="0" class="ghost">清零</button>
+        </div>
+      </div>
+      <div>
+        <label>回包顺序</label>
+        <div class="row">
+          <button data-action="mode" data-value="normal">先到先回</button>
+          <button data-action="mode" data-value="reverse">后到先回</button>
+          <span id="mode-label" class="pill">normal</span>
+        </div>
+        <p class="hint">「后到先回」会把同一批请求逆序应答，用来验证乱序回包仍送达原通道。</p>
+      </div>
+      <div>
+        <label>超时重试场景</label>
+        <div class="row">
+          <input id="stall-ms" type="number" min="0" step="500" value="5000">
+          <button data-action="stall">卡住下一次回包</button>
+        </div>
+        <p class="hint">下一次读取的回包会被压住这么久；客户端先超时，迟到回包应被网关丢弃。</p>
+      </div>
+      <div>
+        <label>断线 / 重连</label>
+        <div class="row">
+          <button data-action="offline" data-value="1" class="danger">断开仪表</button>
+          <button data-action="offline" data-value="0">恢复仪表</button>
+          <button data-action="reset" class="ghost">全部复位</button>
+        </div>
+        <p class="hint">断线时在途读取立即报错；恢复后无需重启网关即可继续读取。</p>
+      </div>
+    </div>
+    <div id="control-status" class="status-line"></div>
+  </section>
+
+  <section class="results">
+    <article class="card result" id="result-a">
+      <h2>通道 A <span class="txid" id="txid-a"></span></h2>
+      <div class="body"><p class="muted">尚未读取</p></div>
+    </article>
+    <article class="card result" id="result-b">
+      <h2>通道 B <span class="txid" id="txid-b"></span></h2>
+      <div class="body"><p class="muted">尚未读取</p></div>
+    </article>
+  </section>
+
+  <section class="card wide">
+    <h2>网关 / 仪表状态</h2>
+    <div class="stats-grid">
+      <dl id="gateway-stats"><dd class="muted">加载中…</dd></dl>
+      <dl id="meter-stats"><dd class="muted">加载中…</dd></dl>
+    </div>
+    <p class="hint">「instrument txids」列出仪表实际看到的事务号：两路同号时，这里应看到被网关改写后的不同值。</p>
+  </section>
+</main>
+
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
